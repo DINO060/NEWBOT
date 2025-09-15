@@ -1,0 +1,27 @@
+# Core dependencies
+pyrogram>=2.0.0
+tgcrypto>=1.2.0
+
+# PDF processing
+pikepdf>=8.0.0
+PyMuPDF>=1.23.0
+
+# Image processing
+Pillow>=9.0.0
+numpy>=1.21.0
+
+# Optional: OpenCV for advanced image detection (template matching)
+opencv-python>=4.5.0
+
+# Optional: For better performance with large PDFs
+# (concurrent.futures is built-in on modern Python; remove external backport)
+
+# System monitoring
+psutil>=5.8.0
+
+# Optional: For better performance (skip on Windows)
+uvloop>=0.16.0; sys_platform != 'win32'
+
+# For Manga/Scribd scraping
+playwright>=1.45.0
+playwright-stealth>=1.0.5
