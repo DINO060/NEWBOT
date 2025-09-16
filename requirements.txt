@@ -2,26 +2,38 @@
 pyrogram>=2.0.0
 tgcrypto>=1.2.0
 
+# MongoDB
+motor>=3.3.0
+pymongo>=4.5.0
+
 # PDF processing
 pikepdf>=8.0.0
 PyMuPDF>=1.23.0
+reportlab>=4.0.0
+img2pdf>=0.4.0
 
 # Image processing
-Pillow>=9.0.0
-numpy>=1.21.0
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0
 
-# Optional: OpenCV for advanced image detection (template matching)
-opencv-python>=4.5.0
-
-# Optional: For better performance with large PDFs
-# (concurrent.futures is built-in on modern Python; remove external backport)
-
-# System monitoring
-psutil>=5.8.0
-
-# Optional: For better performance (skip on Windows)
-uvloop>=0.16.0; sys_platform != 'win32'
-
-# For Manga/Scribd scraping
-playwright>=1.45.0
+# Web scraping (for Scribd)
+playwright>=1.40.0
 playwright-stealth>=1.0.5
+aiohttp>=3.9.0
+aiofiles>=23.0.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# System utilities
+psutil>=5.9.0
+python-dotenv>=1.0.0
+
+# Optional: Performance optimization
+uvloop>=0.19.0; sys_platform != 'win32'
+
+# Development tools (optional)
+black>=23.0.0
+pylint>=3.0.0
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
