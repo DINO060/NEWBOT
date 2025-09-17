@@ -4,6 +4,7 @@ Bot configuration
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+from types import SimpleNamespace
 
 # Paths
 BASE_DIR = Path(__file__).parent
@@ -62,3 +63,22 @@ Send me a PDF and I'll help you clean, edit, add banner and lock it.
     'success_pages': "✅ Pages removed successfully!",
     'error': "❌ Error during processing"
 }
+
+# Lightweight config namespace for optional manga/scribd components
+config = SimpleNamespace(
+    # Playwright / scraping
+    headless=(os.getenv('SCRIBD_HEADLESS', '1').strip() not in {'0', 'false', 'False'}),
+    device_scale_factor=int(os.getenv('DEVICE_SCALE_FACTOR', '2') or '2'),
+    sel_timeout_ms=int(os.getenv('SEL_TIMEOUT_MS', '30000') or '30000'),
+    nav_timeout_ms=int(os.getenv('NAV_TIMEOUT_MS', '60000') or '60000'),
+    scroll_timeout=int(os.getenv('SCROLL_TIMEOUT', '180') or '180'),
+    # HTTP
+    http_timeout=int(os.getenv('HTTP_TIMEOUT', '60') or '60'),
+    download_batch_size=int(os.getenv('DOWNLOAD_BATCH_SIZE', '5') or '5'),
+    # PDF
+    pdf_quality=int(os.getenv('PDF_QUALITY', '85') or '85'),
+    no_compression=bool(int(os.getenv('NO_COMPRESSION', '0') or '0')),
+    max_pages=int(os.getenv('MANGA_MAX_PAGES', '200') or '200'),
+    # Paths
+    temp_dir=str(TEMP_DIR),
+)

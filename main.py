@@ -28,12 +28,14 @@ BANNERS_DIR.mkdir(exist_ok=True)
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Initialize Pyrogram client
+# Initialize Pyrogram client with plugins
 app = Client(
     "pdfbot",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    plugins={"root": "link_bot"},
+    in_memory=True
 )
 
 async def startup():
@@ -48,34 +50,8 @@ async def startup():
     
     logger.info("✅ MongoDB connected")
     
-    # Import handlers to register them
-    try:
-        # Core handlers
-        import link_bot.core
-        logger.info("✅ Core handlers loaded")
-        
-        # Batch handlers
-        import link_bot.batch
-        logger.info("✅ Batch handlers loaded")
-        
-        # Admin handlers
-        import link_bot.admin
-        logger.info("✅ Admin handlers loaded")
-        
-        # Downloader handlers
-        import link_bot.downloaders.scribd
-        logger.info("✅ Scribd downloader loaded")
-        
-        # Optional: Manga handlers if available
-        try:
-            from handlers.manga_handler import cmd_manga_start
-            logger.info("✅ Manga handlers loaded")
-        except ImportError:
-            logger.info("ℹ️ Manga handlers not available")
-        
-    except Exception as e:
-        logger.error(f"❌ Error loading handlers: {e}")
-        sys.exit(1)
+    # Handlers are auto-loaded via plugins
+    logger.info("✅ Plugins loader registered: link_bot/*")
     
     # Start periodic cleanup task
     asyncio.create_task(cleanup_temp_files())
@@ -131,6 +107,27 @@ async def shutdown():
 
 def main():
     """Main function"""
+    # Preflight env checks
+    try:
+        if not isinstance(API_ID, int) or API_ID <= 0:
+            raise ValueError("Invalid API_ID (check .env)")
+        if not API_HASH or len(API_HASH) < 20:
+            raise ValueError("Invalid API_HASH (check .env)")
+        if not BOT_TOKEN or ":" not in BOT_TOKEN:
+            raise ValueError("Invalid BOT_TOKEN (check .env)")
+        # Validate token via HTTPS getMe
+        import json, urllib.request
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+            if not data.get("ok"):
+                raise RuntimeError(f"getMe failed: {data}")
+            uname = data.get("result", {}).get("username")
+            bid = data.get("result", {}).get("id")
+            logger.info(f"🤖 Bot username: @{uname} (id={bid})")
+    except Exception as e:
+        logger.error(f"Preflight failed: {e}")
+        return
+
     # Run startup tasks
     loop = asyncio.get_event_loop()
     loop.run_until_complete(startup())

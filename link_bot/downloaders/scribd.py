@@ -7,7 +7,7 @@ import subprocess
 import logging
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery
@@ -30,112 +30,172 @@ def is_scribd_url(url: str) -> bool:
 
 async def download_from_scribd(url: str, output_dir: str = "downloads") -> Optional[str]:
     """
-    Download a document from Scribd using scribd-downloader
-    Returns the path to the downloaded file or None if failed
+    Legacy external tool method (disabled on Windows environment by default).
+    Returns None to fall back to Playwright.
     """
-    os.makedirs(output_dir, exist_ok=True)
-    
+    return None
+
+async def _collect_page_elements(page) -> List[Tuple[object, float]]:
+    """Collect probable Scribd page nodes across main page and iframes.
+    Returns list of tuples (element_handle, y_position) sorted by y.
+    """
+    selectors = [
+        ".page_container",
+        ".outer_page",
+        "[data-page-number]",
+        ".page",
+        ".text_layer",
+        "canvas.page_canvas",
+        "canvas",
+    ]
+    elements: List[Tuple[object, float]] = []
+
+    async def add_from_context(ctx):
+        for sel in selectors:
+            try:
+                nodes = await ctx.query_selector_all(sel)
+            except Exception:
+                nodes = []
+            for n in nodes:
+                try:
+                    box = await n.bounding_box()
+                    if box and box.get("height", 0) > 20:
+                        elements.append((n, box.get("y", 0.0)))
+                except Exception:
+                    # If bounding box fails, still include with default ordering
+                    elements.append((n, float("inf")))
+
+    # Main page
+    await add_from_context(page)
+
+    # Iframes
     try:
-        # Use scribd-downloader tool
-        # Install with: pip install scribd-downloader
-        result = subprocess.run(
-            ["scribdl", "-i", url],
-            cwd=output_dir,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode != 0:
-            logger.error(f"Scribd download failed: {result.stderr}")
-            return None
-        
-        # Find the downloaded file
-        for fname in os.listdir(output_dir):
-            if fname.lower().endswith((".pdf", ".txt")):
-                return os.path.join(output_dir, fname)
-        
-        return None
-        
-    except subprocess.TimeoutExpired:
-        logger.error("Scribd download timed out")
-        return None
-    except Exception as e:
-        logger.error(f"Error downloading from Scribd: {e}")
-        return None
+        for f in page.frames:
+            try:
+                await add_from_context(f)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Sort by Y position (top to bottom)
+    elements.sort(key=lambda t: t[1])
+    # Deduplicate by element id; ElementHandle has a unique id in repr
+    seen = set()
+    dedup: List[Tuple[object, float]] = []
+    for el, y in elements:
+        key = repr(el)
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append((el, y))
+    return dedup
 
 async def download_from_scribd_playwright(url: str, output_dir: str = "downloads") -> Optional[str]:
     """
-    Alternative method using Playwright for Scribd downloads
-    More robust but requires more setup
+    Playwright-based Scribd downloader with robust element detection and fallbacks.
     """
     try:
-        # Import here to avoid dependency if not needed
         from playwright.async_api import async_playwright
+        try:
+            from playwright_stealth import stealth_async
+        except Exception:
+            stealth_async = None
+        
+        os.makedirs(output_dir, exist_ok=True)
+        headless_env = os.getenv("SCRIBD_HEADLESS", "1").strip()
+        headless = headless_env not in {"0", "false", "False"}
         
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            
-            # Navigate to Scribd URL
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            
-            # Try to extract document title
-            title = await page.title()
-            
-            # Close popups if any
+            browser = await p.chromium.launch(headless=headless)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            if stealth_async is not None:
+                try:
+                    await stealth_async(page)
+                except Exception:
+                    pass
+
+            page.set_default_navigation_timeout(120000)
+            page.set_default_timeout(120000)
+
+            await page.goto(url, wait_until="domcontentloaded", timeout=90000)
             try:
-                close_button = page.locator("button:has-text('Close')")
-                if await close_button.is_visible(timeout=1000):
-                    await close_button.click()
+                await page.wait_for_load_state("networkidle", timeout=60000)
             except Exception:
                 pass
-            
-            # Scroll to load all pages
-            for _ in range(10):
-                await page.evaluate("window.scrollBy(0, window.innerHeight)")
-                await page.wait_for_timeout(500)
-            
-            # Take screenshots of pages (fallback method)
-            output_path = Path(output_dir) / f"{title}.pdf"
-            
-            # Get all page containers
-            pages = await page.query_selector_all(".page_container")
-            
-            if not pages:
-                logger.error("No pages found on Scribd")
-                await browser.close()
-                return None
-            
-            # Create PDF from screenshots
-            from PIL import Image
-            images = []
-            
-            for i, page_elem in enumerate(pages):
-                # Screenshot each page
-                screenshot = await page_elem.screenshot()
-                
-                # Convert to PIL Image
+
+            raw_title = (await page.title()) or "scribd_document"
+            safe_title = "".join(c for c in raw_title if c not in '\\/:*?"<>|').strip() or "scribd_document"
+            output_path = Path(output_dir) / f"{safe_title}.pdf"
+
+            # Try to accept cookies or close popups
+            for selector in ["button:has-text('Accept')", "button:has-text('Got it')", "button:has-text('Close')"]:
+                try:
+                    btn = page.locator(selector)
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click()
+                except Exception:
+                    pass
+
+            # Scrolling to load content
+            for _ in range(30):
+                await page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight*0.9))")
+                await page.wait_for_timeout(400)
+
+            # Try to collect elements
+            elements = await _collect_page_elements(page)
+            if not elements:
+                logger.error("No page-like elements found; falling back to full-page screenshot")
+                # Full page screenshot fallback -> single-page PDF
+                from PIL import Image
                 import io
-                img = Image.open(io.BytesIO(screenshot))
-                images.append(img)
-            
-            # Save as PDF
-            if images:
-                images[0].save(
-                    output_path, 
-                    "PDF",
-                    resolution=100.0,
-                    save_all=True,
-                    append_images=images[1:]
-                )
-                
+                shot = await page.screenshot(full_page=True)
+                img = Image.open(io.BytesIO(shot)).convert("RGB")
+                img.save(output_path, "PDF", resolution=100.0)
+                img.close()
                 await browser.close()
                 return str(output_path)
-            
+
+            # Screenshot each element
+            from PIL import Image
+            import io
+            images = []
+            for idx, (elem, _) in enumerate(elements):
+                try:
+                    b = await elem.bounding_box()
+                    if not b or b.get("height", 0) < 20:
+                        continue
+                    # Ensure element in viewport
+                    try:
+                        await elem.scroll_into_view_if_needed(timeout=5000)
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(150)
+                    shot = await elem.screenshot()
+                    img = Image.open(io.BytesIO(shot)).convert("RGB")
+                    images.append(img)
+                except Exception as e:
+                    logger.error(f"Scribd element screenshot failed at index {idx}: {e}")
+                    continue
+
+            if not images:
+                await browser.close()
+                return None
+
+            # Save as PDF
+            first, rest = images[0], images[1:]
+            first.save(output_path, "PDF", resolution=100.0, save_all=True, append_images=rest)
+            for im in images:
+                try:
+                    im.close()
+                except Exception:
+                    pass
+
             await browser.close()
-            return None
-            
+            return str(output_path)
+
     except Exception as e:
         logger.error(f"Error with Playwright Scribd download: {e}")
         return None
@@ -185,23 +245,27 @@ async def handle_download_url(client: Client, message: Message):
         await handle_scribd_download(client, message, url)
         return
     
-    # Handle direct PDF links
-    if url.lower().endswith('.pdf'):
-        try:
-            await message.reply_text("📥 Downloading PDF...")
-            await client.send_document(
-                chat_id=message.chat.id,
-                document=url,
-                caption="📄 Downloaded PDF"
-            )
-        except Exception as e:
-            logger.error(f"Direct PDF download failed: {e}")
-            await message.reply_text("❌ Couldn't download the file from the URL.")
-        return
-    
-    # Try to download as generic document
+    # Try to download any direct file (PDF or other) to avoid Telegram URL fetch issues
     try:
-        await message.reply_text("📥 Attempting download...")
+        await message.reply_text("📥 Downloading...")
+        local_path = await download_document(url, user_id)
+        if local_path and os.path.exists(local_path):
+            with open(local_path, 'rb') as f:
+                await client.send_document(
+                    chat_id=message.chat.id,
+                    document=f,
+                    caption="📄 Downloaded document"
+                )
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        logger.error(f"Generic download (fetch) failed: {e}")
+    
+    # Fallback: let Telegram try to fetch
+    try:
         await client.send_document(
             chat_id=message.chat.id,
             document=url,
@@ -209,7 +273,7 @@ async def handle_download_url(client: Client, message: Message):
         )
     except Exception as e:
         logger.error(f"Generic download failed: {e}")
-        await message.reply_text("❌ Couldn't download the file. Make sure it's a valid document URL.")
+        await message.reply_text("❌ Couldn't download the file. Make sure it's a direct file link or use supported sources.")
 
 async def handle_scribd_download(client: Client, message: Message, url: str):
     """Handle Scribd document download"""
@@ -222,13 +286,8 @@ async def handle_scribd_download(client: Client, message: Message, url: str):
         # Create user-specific download directory
         user_dir = get_user_temp_dir(user_id)
         
-        # Try primary download method
-        file_path = await download_from_scribd(url, str(user_dir))
-        
-        # If primary fails, try Playwright method
-        if not file_path:
-            await status.edit_text("🔄 Trying alternative method...")
-            file_path = await download_from_scribd_playwright(url, str(user_dir))
+        # Prefer Playwright method
+        file_path = await download_from_scribd_playwright(url, str(user_dir))
         
         if not file_path:
             await status.edit_text("❌ Failed to download the Scribd document.")
@@ -291,9 +350,7 @@ async def download_scribd_batch(client: Client, urls: list, user_id: int) -> lis
             continue
         
         try:
-            # Download each document
-            file_path = await download_from_scribd(url, str(user_dir))
-            
+            file_path = await download_from_scribd_playwright(url, str(user_dir))
             if file_path:
                 downloaded_files.append({
                     'path': file_path,
@@ -342,7 +399,7 @@ async def download_document(url: str, user_id: int) -> Optional[str]:
     user_dir = get_user_temp_dir(user_id)
     
     if is_scribd_url(url):
-        return await download_from_scribd(url, str(user_dir))
+        return await download_from_scribd_playwright(url, str(user_dir))
     
     # Try direct download for other URLs
     try:

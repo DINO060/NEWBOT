@@ -57,80 +57,51 @@ def clean_filename(filename: str) -> str:
 def clean_caption_with_username(original_caption: str, user_id: int = None) -> str:
     """Clean caption and add user's saved username"""
     from utils.sessions import sessions
-    from utils.database import db
-    
-    # Remove existing usernames
-    cleaned = re.sub(r"@[\w_]+", "", original_caption).strip()
+    # Avoid synchronous DB calls here; rely on session data only
+
+    cleaned = re.sub(r"@[^\s]+", "", original_caption or "").strip()
     cleaned = re.sub(r"\s+", " ", cleaned)
-    
-    if user_id:
-        # Get username from session or database
-        session = sessions.get(user_id, {})
-        username = session.get('username')
-        
-        if not username:
-            # Try to get from database (async to sync bridge needed)
-            try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                settings = loop.run_until_complete(db.get_user_settings(user_id))
-                username = settings.get('username')
-            except Exception:
-                pass
-        
-        if username:
-            # Get text position preference
-            pos = session.get('text_position', 'end')
-            if pos == 'start':
-                return f"{username} {cleaned}".strip()
-            else:
-                return f"{cleaned} {username}".strip()
-    
+
+    if not user_id:
+        return cleaned
+
+    session = sessions.get(user_id, {})
+    username = session.get('username')
+
+    if username:
+        pos = session.get('text_position', 'end')
+        if pos == 'start':
+            return f"{username} {cleaned}".strip()
+        return f"{cleaned} {username}".strip()
+
     return cleaned
 
 def build_final_filename(user_id: int, original_name: str) -> str:
-    """Build final filename with user's tag"""
+    """Build final filename with user's tag (session only)."""
     try:
-        base, ext = os.path.splitext(original_name)
+        base, ext = os.path.splitext(original_name or "document.pdf")
         if not ext:
             ext = ".pdf"
-        
-        # Clean base name
+
         base = clean_filename(base)
-        
-        # Get user's tag
+
         from utils.sessions import sessions
-        from utils.database import db
-        
         session = sessions.get(user_id, {})
         username = session.get('username')
-        
+
         if not username:
-            # Try database
-            try:
-                import asyncio
-                loop = asyncio.get_event_loop()
-                settings = loop.run_until_complete(db.get_user_settings(user_id))
-                username = settings.get('username')
-            except Exception:
-                pass
-        
-        if not username:
-            # Sanitize and return
             safe_base = re.sub(r'[\\/:*?"<>|]', '_', base).strip()
             return f"{safe_base}{ext}"
-        
-        # Get position preference
+
         pos = session.get('text_position', 'end')
         if pos == 'start':
             new_base = f"{username} {base}".strip()
         else:
             new_base = f"{base} {username}".strip()
-        
-        # Sanitize
+
         new_base = re.sub(r'[\\/:*?"<>|]', '_', new_base)
         return f"{new_base}{ext}"
-        
+
     except Exception as e:
         logger.error(f"build_final_filename error: {e}")
         return original_name

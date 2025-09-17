@@ -40,6 +40,16 @@ class MongoDB:
         # Batch collection
         await self.db.batch_files.create_index('user_id')
         await self.db.batch_files.create_index('created_at')
+
+        # Messages and files collections
+        try:
+            await self.db.messages.create_index([('user_id', 1), ('date', -1)])
+        except Exception:
+            pass
+        try:
+            await self.db.files.create_index([('user_id', 1), ('created_at', -1)])
+        except Exception:
+            pass
         
     async def disconnect(self):
         """Disconnect from MongoDB"""
@@ -70,6 +80,37 @@ class MongoDB:
             return True
         except Exception as e:
             logger.error(f"Error tracking user {user_id}: {e}")
+            return False
+
+    async def save_message(self, user_id: int, message) -> bool:
+        """Persist a message (text/command) to MongoDB."""
+        try:
+            await self.db.messages.insert_one({
+                'user_id': user_id,
+                'message_id': getattr(message, 'id', getattr(message, 'message_id', None)),
+                'text': getattr(message, 'text', None),
+                'date': getattr(message, 'date', None)
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error saving message: {e}")
+            return False
+
+    async def save_file(self, user_id: int, document) -> bool:
+        """Persist basic metadata about a Telegram document/file."""
+        try:
+            await self.db.files.insert_one({
+                'user_id': user_id,
+                'file_id': getattr(document, 'file_id', None),
+                'file_unique_id': getattr(document, 'file_unique_id', None),
+                'file_name': getattr(document, 'file_name', None),
+                'file_size': getattr(document, 'file_size', None),
+                'mime_type': getattr(document, 'mime_type', None),
+                'created_at': datetime.now()
+            })
+            return True
+        except Exception as e:
+            logger.error(f"Error saving file: {e}")
             return False
     
     async def get_user(self, user_id: int) -> Optional[Dict]:

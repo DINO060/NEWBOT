@@ -25,12 +25,17 @@ from utils.helpers import (
     create_or_edit_status,
     is_pdf_file
 )
+from utils.banner_cleaner import clean_pdf_banners
+from link_bot.core import (
+    _ensure_banner_pdf_path,
+    add_banner_pages_to_pdf,
+    lock_pdf_with_password,
+    remove_pages_by_numbers,
+)
 
 logger = logging.getLogger(__name__)
 
-# Global batch storage
-user_batches: Dict[int, List[Dict]] = {}
-MAX_BATCH_FILES = 24
+from link_bot.batch_state import user_batches, MAX_BATCH_FILES
 
 def clear_user_batch(user_id: int) -> None:
     """Clear user's batch"""
@@ -591,6 +596,15 @@ async def handle_batch_callbacks(client: Client, query: CallbackQuery):
         password = settings.get('lock_password')
         await process_batch_lock(client, query.message, user_id, password)
     
+    elif action == "batch_fullproc":
+        session['batch_action'] = 'fullproc'
+        session['awaiting_batch_fullproc_password'] = True
+        await query.edit_message_text(
+            "⚡ **Full Process - Batch**\n\n"
+            "Step 1/3: Send unlock password (or 'none' if not protected):",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     # Pages selection handlers
     elif action == "batch_pages_first":
         await process_batch_pages(client, query.message, user_id, "first")
@@ -615,3 +629,190 @@ async def handle_batch_callbacks(client: Client, query: CallbackQuery):
     elif action == "batch_both_manual":
         session['awaiting_batch_both_pages'] = True
         await query.edit_message_text("📝 Send pages to remove (e.g. `1,3-5`) or `none`.")
+
+@Client.on_message(filters.text & filters.private)
+async def handle_batch_text_steps(client: Client, message: Message):
+    """Handle interactive text steps for batch workflows."""
+    user_id = message.from_user.id
+    session = ensure_session_dict(user_id)
+
+    # Unlock (all)
+    if session.get('awaiting_batch_password'):
+        session.pop('awaiting_batch_password', None)
+        password = (message.text or '').strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await process_batch_unlock(client, message, user_id, password)
+        return
+
+    # Pages (all)
+    if session.get('awaiting_batch_pages'):
+        session.pop('awaiting_batch_pages', None)
+        pages_spec = (message.text or '').strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await process_batch_pages(client, message, user_id, pages_spec)
+        return
+
+    # The Both - step 1 password
+    if session.get('awaiting_batch_both_password'):
+        session.pop('awaiting_batch_both_password', None)
+        password = (message.text or '').strip()
+        session['batch_both_password'] = password
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.reply_text(
+            "🛠️ **The Both - Batch**\n\nStep 2/2: Send pages to remove (e.g. `1,3-5`) or `none`.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        session['awaiting_batch_both_pages'] = True
+        return
+
+    # The Both - step 2 pages
+    if session.get('awaiting_batch_both_pages'):
+        session.pop('awaiting_batch_both_pages', None)
+        pages_spec = (message.text or '').strip()
+        password = session.get('batch_both_password', '')
+        session.pop('batch_both_password', None)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await process_batch_both(client, message, user_id, password, pages_spec)
+        return
+
+    # Full Process - step 1 unlock password
+    if session.get('awaiting_batch_fullproc_password'):
+        session.pop('awaiting_batch_fullproc_password', None)
+        session['batch_fullproc_password'] = (message.text or '').strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.reply_text("**Full Process - Batch**\n\nStep 2/3: Pages to remove (e.g. `1,3-5`) or `none`.", parse_mode=ParseMode.MARKDOWN)
+        session['awaiting_batch_fullproc_pages'] = True
+        return
+
+    # Full Process - step 2 pages
+    if session.get('awaiting_batch_fullproc_pages'):
+        session.pop('awaiting_batch_fullproc_pages', None)
+        session['batch_fullproc_pages'] = (message.text or '').strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.reply_text("**Full Process - Batch**\n\nStep 3/3: Lock password (or `skip`).", parse_mode=ParseMode.MARKDOWN)
+        session['awaiting_batch_fullproc_lock'] = True
+        return
+
+    # Full Process - step 3 lock password and execute
+    if session.get('awaiting_batch_fullproc_lock'):
+        session.pop('awaiting_batch_fullproc_lock', None)
+        lock_pw = (message.text or '').strip()
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        files = user_batches.get(user_id) or await db.get_batch_files(user_id)
+        pdf_files = [f for f in files if is_pdf_file(f.get('file_name', ''))]
+        unlock_pw = session.pop('batch_fullproc_password', '')
+        pages_text = session.pop('batch_fullproc_pages', 'none')
+
+        # Parse pages
+        from utils.helpers import parse_pages_spec
+        pages_to_remove = [] if pages_text.strip().lower() in {'none', 'no', 'skip', '0'} else list(parse_pages_spec(pages_text))
+        if lock_pw.lower() in {'skip', 'none', 'no'}:
+            lock_pw = ''
+
+        await execute_batch_full_pipeline(client, message, user_id, pdf_files, unlock_pw, pages_to_remove, lock_pw)
+        return
+
+async def execute_batch_full_pipeline(client: Client, message: Message, user_id: int,
+                                      files: List[Dict], unlock_pw: str,
+                                      pages_to_remove: List[int], lock_pw: str):
+    """Execute Full Process pipeline for all PDFs in batch."""
+    if not files:
+        await message.reply_text("❌ No PDF files in batch")
+        return
+
+    session = ensure_session_dict(user_id)
+    status = await create_or_edit_status(client, message, f"⏳ Full Process on {len(files)} files...")
+    success = 0
+    errors = 0
+
+    try:
+        for i, file_info in enumerate(files):
+            try:
+                await status.edit_text(f"⏳ Processing file {i+1}/{len(files)}...")
+
+                # Download
+                file_path = await client.download_media(
+                    file_info['file_id'],
+                    file_name=f"{get_user_temp_dir(user_id)}/batch_{i}.pdf"
+                )
+
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    current = Path(temp_dir) / "input.pdf"
+                    shutil.move(file_path, current)
+
+                    # 1. Unlock
+                    if unlock_pw and unlock_pw.lower() != 'none':
+                        unlocked = Path(temp_dir) / "unlocked.pdf"
+                        with pikepdf.open(str(current), password=unlock_pw) as pdf:
+                            pdf.save(str(unlocked))
+                        current = unlocked
+
+                    # 2. Clean banners
+                    with open(current, 'rb') as f:
+                        pdf_bytes = f.read()
+                    cleaned_bytes = clean_pdf_banners(pdf_bytes, user_id)
+                    cleaned = Path(temp_dir) / "cleaned.pdf"
+                    with open(cleaned, 'wb') as f:
+                        f.write(cleaned_bytes)
+                    current = cleaned
+
+                    # 3. Add banner
+                    banner_pdf = await _ensure_banner_pdf_path(user_id)
+                    if not banner_pdf:
+                        from link_bot.core import create_default_banner_pdf
+                        banner_pdf = create_default_banner_pdf(user_id)
+                    if banner_pdf:
+                        bannered = Path(temp_dir) / "bannered.pdf"
+                        await add_banner_pages_to_pdf(str(current), str(bannered), banner_pdf, 'after')
+                        current = bannered
+
+                    # 4. Remove pages
+                    if pages_to_remove:
+                        paged = Path(temp_dir) / "paged.pdf"
+                        remove_pages_by_numbers(str(current), str(paged), pages_to_remove)
+                        current = paged
+
+                    # 5. Lock
+                    if lock_pw:
+                        locked = Path(temp_dir) / "locked.pdf"
+                        lock_pdf_with_password(str(current), str(locked), lock_pw)
+                        current = locked
+
+                    # Send
+                    new_name = build_final_filename(user_id, file_info['file_name'])
+                    delay = session.get('delete_delay', 300)
+                    await send_and_delete(client, message.chat.id, str(current), new_name, delay_seconds=delay)
+                    success += 1
+
+            except Exception as e:
+                logger.error(f"Batch Full Process error on file {i}: {e}")
+                errors += 1
+
+        await status.edit_text(
+            f"✅ Full Process complete!\n\nSuccessful: {success}\nErrors: {errors}"
+        )
+    finally:
+        clear_user_batch(user_id)
+        session.pop('batch_mode', None)
