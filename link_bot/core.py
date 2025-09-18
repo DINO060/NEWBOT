@@ -48,6 +48,20 @@ BANNERS_DIR.mkdir(exist_ok=True)
 # Uptime reference
 START_TS = time.time()
 
+# Debug echo (optional via env DEBUG_ECHO=1)
+import os as _os
+_DEBUG_ECHO = str(_os.getenv('DEBUG_ECHO', '0')).strip() not in {'0', 'false', 'False', ''}
+
+@Client.on_message()
+async def debug_echo(client: Client, message: Message):
+    if not _DEBUG_ECHO:
+        return
+    try:
+        logger.info(f"[DEBUG ECHO] Got message from {getattr(message.from_user, 'id', None)}: {getattr(message, 'text', None)!r}")
+        await message.reply_text(f"✅ Received (debug echo): {getattr(message, 'text', '')}")
+    except Exception as e:
+        logger.error(f"debug_echo error: {e}")
+
 # Messages
 MESSAGES = {
     'start': """👋 Welcome to Advanced PDF Tools Bot!

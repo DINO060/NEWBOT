@@ -300,13 +300,14 @@ def is_duplicate_message(user_id: int, message_id: int, command_type: str = "mes
     if not check_rate_limit(user_id, batch_mode):
         return "rate_limit"
     
-    # Check repeated commands
+    # Check repeated commands (do not drop /start to avoid silent UX)
     if command_type in ["start", "batch", "process"]:
-        if user_id in user_last_command:
-            last_cmd, last_time = user_last_command[user_id]
-            if last_cmd == command_type and (current_time - last_time).total_seconds() < 2:
-                logger.info(f"Command {command_type} ignored - repeated too quickly")
-                return "duplicate"
+        if command_type != "start":
+            if user_id in user_last_command:
+                last_cmd, last_time = user_last_command[user_id]
+                if last_cmd == command_type and (current_time - last_time).total_seconds() < 2:
+                    logger.info(f"Command {command_type} ignored - repeated too quickly")
+                    return "duplicate"
         user_last_command[user_id] = (command_type, current_time)
     
     # Check message ID

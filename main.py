@@ -1,5 +1,5 @@
 """
-Main entry point for PDF Bot
+Main entry point for PDF Bot (Pyrogram + plugins) with robust startup/idle.
 """
 import os
 import sys
@@ -7,9 +7,9 @@ import asyncio
 import logging
 from pathlib import Path
 
-from pyrogram import Client
+from pyrogram import Client, idle, filters
 from utils.database import db
-from config import API_ID, API_HASH, BOT_TOKEN
+from config import API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS
 
 # Configure logging
 logging.basicConfig(
@@ -28,36 +28,74 @@ BANNERS_DIR.mkdir(exist_ok=True)
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-# Initialize Pyrogram client with plugins
+def _parse_admin_ids(raw: str):
+    try:
+        return [int(x) for x in str(raw or '').split(',') if x.strip()]
+    except Exception:
+        return []
+
+# Initialize Pyrogram client with plugins (in-memory session to avoid local corruption)
 app = Client(
     "pdfbot",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    plugins={"root": "link_bot"},
-    in_memory=True
 )
 
+# Explicitly import handlers to rule out plugin loader issues
+from link_bot import core as _core_handlers  # noqa: F401
+from link_bot import admin as _admin_handlers  # noqa: F401
+from link_bot import batch as _batch_handlers  # noqa: F401
+from link_bot import debug_echo as _debug_handlers  # noqa: F401
+
 async def startup():
-    """Startup tasks"""
+    """Startup tasks (after app.start())."""
     logger.info("🚀 Starting PDF Bot...")
-    
-    # Connect to MongoDB
-    connected = await db.connect()
-    if not connected:
+
+    # DB connect
+    if not await db.connect():
         logger.error("❌ Failed to connect to MongoDB. Exiting...")
         sys.exit(1)
-    
     logger.info("✅ MongoDB connected")
-    
-    # Handlers are auto-loaded via plugins
+
+    # Log identity via Bot API
+    try:
+        me = await app.get_me()
+        logger.info(f"🤖 Bot username: @{getattr(me, 'username', None)} (id={getattr(me, 'id', None)})")
+    except Exception as e:
+        logger.error(f"get_me failed: {e}")
+
     logger.info("✅ Plugins loader registered: link_bot/*")
-    
-    # Start periodic cleanup task
+
+    # Sanity check handler registered locally
+    @app.on_message(filters.command("ping") & filters.private)
+    async def _local_ping(_, message):
+        try:
+            await message.reply_text("pong")
+        except Exception as e:
+            logger.error(f"local /ping failed: {e}")
+
+    # Temporary local /start for sanity (bypasses plugin handlers)
+    @app.on_message(filters.command("start") & filters.private)
+    async def _local_start(_, message):
+        try:
+            await message.reply_text("✅ Start OK (local handler)")
+        except Exception as e:
+            logger.error(f"local /start failed: {e}")
+
+    # Ping admins to verify outbound delivery
+    admin_ids = _parse_admin_ids(ADMIN_IDS)
+    for aid in admin_ids:
+        try:
+            await app.send_message(aid, "🟢 Bot démarré. Envoyez /ping ici pour tester la réception.")
+            logger.info(f"Sent startup ping to admin {aid}")
+        except Exception as e:
+            logger.error(f"Startup ping failed for {aid}: {e}")
+
+    # Start periodic cleanup
     asyncio.create_task(cleanup_temp_files())
     logger.info("✅ Cleanup task started")
-    
-    logger.info("🟢 Bot is ready!")
+    logger.info("🟢 Bot is ready! Send /start in DM.")
 
 async def cleanup_temp_files():
     """Periodically clean temporary files"""
@@ -105,42 +143,25 @@ async def shutdown():
     
     logger.info("👋 Goodbye!")
 
-def main():
-    """Main function"""
-    # Preflight env checks
-    try:
-        if not isinstance(API_ID, int) or API_ID <= 0:
-            raise ValueError("Invalid API_ID (check .env)")
-        if not API_HASH or len(API_HASH) < 20:
-            raise ValueError("Invalid API_HASH (check .env)")
-        if not BOT_TOKEN or ":" not in BOT_TOKEN:
-            raise ValueError("Invalid BOT_TOKEN (check .env)")
-        # Validate token via HTTPS getMe
-        import json, urllib.request
-        with urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=10) as r:
-            data = json.loads(r.read().decode("utf-8"))
-            if not data.get("ok"):
-                raise RuntimeError(f"getMe failed: {data}")
-            uname = data.get("result", {}).get("username")
-            bid = data.get("result", {}).get("id")
-            logger.info(f"🤖 Bot username: @{uname} (id={bid})")
-    except Exception as e:
-        logger.error(f"Preflight failed: {e}")
-        return
+async def runner():
+    # Basic env sanity
+    if not isinstance(API_ID, int) or API_ID <= 0:
+        raise SystemExit("🚫 Invalid API_ID")
+    if not API_HASH or len(API_HASH) < 20:
+        raise SystemExit("🚫 Invalid API_HASH")
+    if not BOT_TOKEN or ":" not in BOT_TOKEN:
+        raise SystemExit("🚫 Invalid BOT_TOKEN")
 
-    # Run startup tasks
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(startup())
-    
+    await app.start()
     try:
-        # Start the bot
-        logger.info("🤖 Starting Pyrogram client...")
-        app.run()
-    except KeyboardInterrupt:
-        logger.info("⛔ Bot stopped by user")
+        await startup()
+        await idle()
     finally:
-        # Run shutdown tasks
-        loop.run_until_complete(shutdown())
+        await shutdown()
+        await app.stop()
+
+def main():
+    asyncio.run(runner())
 
 if __name__ == "__main__":
     main()
